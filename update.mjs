@@ -10,7 +10,7 @@ let runCmd = (commandString) => new Promise((resolve, reject) => {
   cmd.stdout.on('data', (data) => {
     stdoutData += data
     process.stdout.write(data)
-})
+  })
   cmd.stderr.on('data', (data) => process.stderr.write(data))
   cmd.on('error', (e) => reject(e))
   cmd.on('close', (e) => e == 0 ? resolve(stdoutData) : reject(`Return code: ${e}`))
