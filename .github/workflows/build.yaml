@@ -44,33 +44,38 @@ jobs:
           fetch-depth: 0
           ref: ${{ steps.get_tag.outputs.tag }}
       
-      - name: Fix line endings (Windows)
-        if: ${{ runner.os == 'Windows' }}
-        shell: pwsh
-        run: |
-          git config --global core.autocrlf false
-          git config --global core.eol lf
-    
-          Get-ChildItem -Path . -Recurse -Include "*.ts","*.js","*.json","*.sh" | ForEach-Object {
-            if (Test-Path $_.FullName) {
-              try {
-                $content = Get-Content $_.FullName -Raw -ErrorAction Stop
-                if ($content) {
-                  $content = $content -replace "`r`n", "`n"
-                  Set-Content $_.FullName -Value $content -NoNewline -Encoding UTF8
-                }
-              }
-              catch {
-                Write-Warning "Failed to process file: $($_.FullName)"
-              }
-            }
-          }
-      
       - name: Setup Node.js
         uses: actions/setup-node@v4.4.0
         with:
           node-version: 22.x
       
+      - name: Force LF line endings
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+          node -e "
+          const fs = require('fs'), path = require('path');
+          const exts = ['.ts','.js','.json','.sh'];
+
+          function walk(dir) {
+            return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e =>
+              e.isDirectory() ? walk(path.join(dir,e.name)) : exts.includes(path.extname(e.name)) ? [path.join(dir,e.name)] : []
+            );
+          }
+
+          const files = walk(process.cwd());
+
+          files.forEach(f => {
+            const content = fs.readFileSync(f,'utf8');
+            if (content.includes('\r')) {
+              fs.writeFileSync(f, content.replace(/\r/g,''),'utf8');
+              console.log('✅',f);
+            }
+          });
+          "
+
       - name: Install dbus on Ubuntu
         if: ${{ runner.os == 'Linux' }}
         run: |
