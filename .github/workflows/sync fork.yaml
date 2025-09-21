@@ -1,0 +1,125 @@
+name: Sync Fork Master and Tags
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v3
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.BOT_PAT }}
+
+      - name: Bot Details
+        id: bot-details
+        uses: raven-actions/bot-details@v1
+
+      - name: Configure Git
+        run: |
+          git config --local user.name "${{ steps.bot-details.outputs.name }}"
+          git config --local user.email "${{ steps.bot-details.outputs.email }}"
+
+      - name: Get current tags before sync
+        id: before-sync
+        run: |
+          echo "current_tags<<EOF" >> $GITHUB_OUTPUT
+          git tag -l --sort=-version:refname | head -10 >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/Affirmatech/MeshSense.git
+          git fetch upstream --tags
+
+      - name: Rebase fork commits onto upstream
+        run: |
+          git checkout master
+          git rebase upstream/master
+
+      - name: Push master and tags to fork
+        run: |
+          git push origin master --force-with-lease
+          git push origin --tags --force
+
+      - name: Get tags after sync and detect new ones
+        id: after-sync
+        run: |
+          echo "new_tags<<EOF" >> $GITHUB_OUTPUT
+          git tag -l --sort=-version:refname | head -10 >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Compare tags and find newest
+        id: compare-tags
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const beforeTags = `${{ steps.before-sync.outputs.current_tags }}`.split('\n').filter(t => t.trim());
+            const afterTags = `${{ steps.after-sync.outputs.new_tags }}`.split('\n').filter(t => t.trim());
+            
+            console.log('Before sync tags:', beforeTags);
+            console.log('After sync tags:', afterTags);
+            
+            // 找出新增的 tags
+            const newTags = afterTags.filter(tag => !beforeTags.includes(tag));
+            
+            if (newTags.length > 0) {
+              // 獲取最新的 tag (已排序，第一個就是最新的)
+              const latestNewTag = newTags[0];
+              console.log(`✅ Found new tags: ${newTags.join(', ')}`);
+              console.log(`🎯 Latest new tag: ${latestNewTag}`);
+              
+              core.setOutput('has_new_tags', 'true');
+              core.setOutput('latest_new_tag', latestNewTag);
+              core.setOutput('all_new_tags', newTags.join(','));
+            } else {
+              console.log('ℹ️ No new tags found');
+              core.setOutput('has_new_tags', 'false');
+            }
+
+      - name: Trigger build workflow for new tag
+        if: steps.compare-tags.outputs.has_new_tags == 'true'
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.BOT_PAT }}
+          script: |
+            const latestNewTag = '${{ steps.compare-tags.outputs.latest_new_tag }}';
+            
+            console.log(`🚀 Triggering build workflow for tag: ${latestNewTag}`);
+            
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'build.yaml',
+                ref: 'master',
+                inputs: {
+                  tag: latestNewTag
+                }
+              });
+              
+              console.log(`✅ Successfully triggered build workflow for tag: ${latestNewTag}`);
+            } catch (error) {
+              console.error(`❌ Failed to trigger build workflow:`, error.message);
+              core.setFailed(`Failed to trigger build workflow: ${error.message}`);
+            }
+
+      - name: Summary
+        run: |
+          echo "## Sync Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Master branch**: Synced successfully" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tags synced**: Yes" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.compare-tags.outputs.has_new_tags }}" == "true" ]; then
+            echo "- **New tags found**: ${{ steps.compare-tags.outputs.all_new_tags }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Build triggered for**: ${{ steps.compare-tags.outputs.latest_new_tag }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status**: ✅ Build workflow triggered" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **New tags found**: None" >> $GITHUB_STEP_SUMMARY
+            echo "- **Status**: ℹ️ No build triggered" >> $GITHUB_STEP_SUMMARY
+          fi
