@@ -1,0 +1,223 @@
+name: Build MeshSense
+
+on:
+  push:
+    tags:
+      - "v*" 
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (leave blank for latest)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025]
+  
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve tag
+        id: get_tag
+        shell: bash
+        run: |
+          if [ -z "${{ github.event.inputs.tag }}" ]; then
+            latest_tag=$(git describe --tags `git rev-list --tags --max-count=1`)
+            echo "tag=$latest_tag" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout target tag
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ steps.get_tag.outputs.tag }}
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22.x
+      
+      - name: Force LF line endings
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+          node -e "
+          const fs = require('fs'), path = require('path');
+          const exts = ['.ts','.js','.json','.sh'];
+
+          function walk(dir) {
+            return fs.readdirSync(dir, { withFileTypes: true }).flatMap(e =>
+              e.isDirectory() ? walk(path.join(dir,e.name)) : exts.includes(path.extname(e.name)) ? [path.join(dir,e.name)] : []
+            );
+          }
+
+          const files = walk(process.cwd());
+
+          files.forEach(f => {
+            const content = fs.readFileSync(f,'utf8');
+            if (content.includes('\r')) {
+              fs.writeFileSync(f, content.replace(/\r/g,''),'utf8');
+              console.log('✅',f);
+            }
+          });
+          "
+
+      - name: Install dbus on Ubuntu
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libdbus-1-dev
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          echo "📦 Installing UI dependencies"
+          cd ui && npm ci
+          
+          echo "📦 Installing API dependencies"
+          cd ../api && npm ci
+          
+          echo "📦 Installing Electron dependencies"
+          cd ../electron && npm ci
+          
+          echo "📦 Installing webbluetooth dependencies"
+          cd ../api/webbluetooth && npm ci
+          
+          echo "📦 Installing & building meshtastic-js dependencies"
+          cd ../meshtastic-js && npm ci && npm run build
+
+      - name: Copy custom builder-config
+        shell: bash
+        run: |
+          echo "📋 Copying custom electron-builder config"
+          
+          curl -sL https://raw.githubusercontent.com/kukuxx/MeshSense/master/.github/workflows/electron-builder-custom-config.js \
+               -o electron/electron-builder-custom-config.js
+
+          if [ -f "electron/electron-builder-custom-config.js" ]; then
+              echo "✅ electron-builder-custom-config.js successfully copied"
+          else
+              echo "❌ electron-builder-custom-config.js copy failed"
+              exit 1
+          fi
+
+          echo "🔍 Validating electron-builder config..."
+          node -c electron/electron-builder-custom-config.js || {
+            echo "❌ electron-builder-custom-config.js is invalid"
+            exit 1
+          }
+          echo "✅ copy and validation complete"
+
+      - name: Build MeshSense
+        shell: bash
+        run: |
+          set -e
+
+          echo "🚀 Building webbluetooth & UI in parallel..."
+          npm --prefix ./api/webbluetooth run build:all &
+          WEBBLUETOOTH_PID=$!
+          npm --prefix ./ui run build &
+          UI_PID=$!
+          
+          wait $WEBBLUETOOTH_PID || {
+            echo "❌ WebBluetooth build failed"
+            exit 1
+          }
+          wait $UI_PID || {
+            echo "❌ UI build failed"  
+            exit 1
+          }
+          
+          echo "✅ UI & WebBluetooth build complete"
+          echo "⚡ Building API..."
+          npm --prefix ./api run build
+
+          cd electron
+
+          echo "⚡ Building Electron app for $RUNNER_OS"
+          case "$RUNNER_OS" in
+            Windows)
+              BUILD_ARCH="--win"
+              ;;
+            macOS)
+              BUILD_ARCH="--mac"
+              ;;
+            Linux)
+              BUILD_ARCH="--linux"
+              ;;
+            *)
+              echo "❌ Unsupported OS: $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+
+          echo "🔧 Running npm build..."
+          NODE_OPTIONS="--trace-uncaught" npm run build
+          
+          echo "📦 Building with electron-builder..."
+          npx electron-builder $BUILD_ARCH \
+            --config=electron-builder-custom-config.js \
+            --c.extraMetadata.version=2.0.0 \
+            --publish=never
+
+          cd ..
+          echo "✅ Build complete"
+
+      - name: Set upload name
+        id: set_upload_name
+        shell: bash
+        run: |
+          case "${{ matrix.os }}" in
+            ubuntu-24.04)
+              echo "output_name=MeshSense-Linux-amd64-${{ steps.get_tag.outputs.tag }}" >> $GITHUB_OUTPUT
+              ;;
+            ubuntu-24.04-arm)
+              echo "output_name=MeshSense-Linux-arm64-${{ steps.get_tag.outputs.tag }}" >> $GITHUB_OUTPUT
+              ;;
+            macos-15-intel)
+              echo "output_name=MeshSense-macOS-amd64-${{ steps.get_tag.outputs.tag }}" >> $GITHUB_OUTPUT
+              ;;
+            macos-15)
+              echo "output_name=MeshSense-macOS-arm64-${{ steps.get_tag.outputs.tag }}" >> $GITHUB_OUTPUT
+              ;;
+            windows-2025)
+              echo "output_name=MeshSense-Windows-amd64-${{ steps.get_tag.outputs.tag }}" >> $GITHUB_OUTPUT
+              ;;
+          esac
+        
+      - name: Package build as tar.gz
+        shell: bash
+        run: |
+          cd electron/dist
+          OUTPUT_NAME="${{ steps.set_upload_name.outputs.output_name }}"
+          tar -czf "../${OUTPUT_NAME}.tar.gz" ./*
+          cd ../../
+
+      - name: Create or upload GitHub Release
+        shell: bash
+        run: |
+          gh auth login --with-token <<< "${{ secrets.GITHUB_TOKEN }}"
+
+          TAG_NAME=${{ steps.get_tag.outputs.tag }}
+          PRERELEASE_FLAG=""
+          if [[ "$TAG_NAME" == *"-beta."* ]] || [[ "$TAG_NAME" == *"-rc."* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+
+          gh release create "$TAG_NAME" --title "$TAG_NAME" --generate-notes $PRERELEASE_FLAG || echo "Release already exists"
+          gh release upload "$TAG_NAME" electron/${{ steps.set_upload_name.outputs.output_name }}.tar.gz --clobber
+
